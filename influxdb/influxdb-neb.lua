@@ -112,20 +112,19 @@ function EventQueue:add(e)
     end
     previous_event = current_event
     broker_log:info(3, "EventQueue:add: " .. current_event)
-    -- let's get and verify we have perfdata
-    local perfdata, perfdata_err = broker.parse_perfdata(e.perfdata)
-    if perfdata_err then
-        broker_log:info(3, "EventQueue:add: No metric: " .. perfdata_err)
-        return false
-    end
+
+    local type = "host"
     -- retrieve objects names instead of IDs
     local host_name = broker_cache:get_hostname(e.host_id)
-    local service_description
+    local service_description 
+
     if e.service_id then
+        type = "service"
         service_description = broker_cache:get_service_description(e.host_id, e.service_id)
     else
         service_description = "host-latency"
     end
+
     -- what if we could not get them from cache
     if not host_name then
         broker_log:warning(1, "EventQueue:add: host_name for id " .. e.host_id ..
@@ -143,6 +142,7 @@ function EventQueue:add(e)
         end
         service_description = e.service_id
     end
+
     -- message format : <measurement>[,<tag-key>=<tag-value>...]
     --  <field-key>=<field-value>[,<field2-key>=<field2-value>...] [unix-nano-timestamp]
     -- some characters [ ,=] must be escaped, let's replace them by _ for better handling
@@ -153,32 +153,51 @@ function EventQueue:add(e)
         service_description = string.gsub(service_description, " +[^ ]+$", "", 1)
     end
     service_description = string.gsub(service_description, "[ ,=]+", self.replacement_character)
-    -- define messages from perfata, transforming instance names to inst tags, which leads to one message per instance
-    -- consider new perfdata (dot-separated metric names) only (of course except for host-latency)
-    local instances = {}
-    local perfdate = e.last_check
-    for m,v in pairs(perfdata) do
-        local inst, metric = string.match(m, "(.+)#(.+)")
-        if not inst then
-            inst = ""
-            metric = m
-        else
-            inst = ",inst=" .. string.gsub(inst, "[ ,=]+", self.replacement_character)
+
+    -- let's get and verify we have status data
+    if string.match(self.filter_type, "status") then
+        self.events[#self.events + 1] = self.measurement .. service_description .. ",host=" .. host_name .. item .. ",type=" .. type  .. " state_type=" .. e.state_type .. ",state=" .. e.state .. "\n"
+        broker_log:info(3, "EventQueue:add: adding status data  " .. self.events[#self.events])
+    end
+
+    -- let's get and verify we have perfdata
+    if string.match(self.filter_type, "metric") then
+        local perfdata, perfdata_err = broker.parse_perfdata(e.perfdata)
+        if perfdata_err then
+            broker_log:info(3, "EventQueue:add: No metric: " .. perfdata_err)
+            return false
         end
-        if (not e.service_id and metric ~= "time") or string.match(metric, ".+[.].+") then
-            if not instances[inst] then
-                instances[inst] = self.measurement .. service_description .. ",host=" .. host_name .. item .. inst .. " "
+
+        -- service_description = string.gsub(service_description, "[ ,=]+", self.replacement_character)
+        -- -- define messages from perfata, transforming instance names to inst tags, which leads to one message per instance
+        -- -- consider new perfdata (dot-separated metric names) only (of course except for host-latency)
+        local instances = {}
+        local perfdate = e.last_check
+        for m,v in pairs(perfdata) do
+            local inst, metric = string.match(m, "(.+)#(.+)")
+            if not inst then
+                inst = ""
+                metric = m
+            else
+                inst = ",inst=" .. string.gsub(inst, "[ ,=]+", self.replacement_character)
             end
-            instances[inst] = instances[inst] .. metric .. "=" .. v .. ","
-        elseif metric == "perfdate" then
-            perfdate = v
+            if (not e.service_id and metric ~= "time") or string.match(metric, ".+[.].+") then
+                if not instances[inst] then
+                    instances[inst] = self.measurement .. service_description .. ",host=" .. host_name .. item .. inst .. " "
+                end
+                instances[inst] = instances[inst] .. metric .. "=" .. v .. ","
+            elseif metric == "perfdate" then
+                perfdate = v
+            end
         end
+        -- compute final messages to push
+        for _,v in pairs(instances) do
+            self.events[#self.events + 1] = v:sub(1, -2) .. " " .. perfdate .. "000000000" .. "\n"
+            broker_log:info(3, "EventQueue:add: adding perfdata  " .. self.events[#self.events]:sub(1, -2))
+        end
+
     end
-    -- compute final messages to push
-    for _,v in pairs(instances) do
-        self.events[#self.events + 1] = v:sub(1, -2) .. " " .. perfdate .. "000000000" .. "\n"
-        broker_log:info(3, "EventQueue:add: adding " .. self.events[#self.events]:sub(1, -2))
-    end
+
     -- then we check whether it is time to send the events to the receiver and flush
     if #self.events >= self.max_buffer_size then
         broker_log:info(2, "EventQueue:add: flushing because buffer size reached " .. self.max_buffer_size ..
@@ -212,6 +231,7 @@ function EventQueue.new(conf)
         influx_retention_policy     = "",
         influx_username             = "",
         influx_password             = "",
+        filter_type                 = "metric,status",
         max_buffer_size             = 5000,
         max_buffer_age              = 30,
         skip_anon_events            = 1,
